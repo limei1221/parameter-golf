@@ -64,9 +64,8 @@ class Hyperparameters:
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_frac = float(os.environ.get("WARMDOWN_FRAC", 0.2))
-    swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "0")))
-    swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.4))
-    swa_every = int(os.environ.get("SWA_EVERY", 50))
+    ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "0")))
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
@@ -80,7 +79,7 @@ class Hyperparameters:
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = float(os.environ.get("MLP_MULT", 3.0))
-    mlp_activation = os.environ.get("MLP_ACTIVATION", "xielu")  # "relu2" or "xielu"
+    mlp_activation = os.environ.get("MLP_ACTIVATION", "xielu")  # "relu2", "leakyrelu2", or "xielu"
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "1")))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
@@ -630,7 +629,11 @@ class MLP(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         if self.activation == "xielu":
             return self.proj(self.act(self.fc(x)))
-        x = torch.relu(self.fc(x))
+        x = self.fc(x)
+        if self.activation == "leakyrelu2":
+            x = F.leaky_relu(x)
+        else:
+            x = torch.relu(x)
         return self.proj(x.square())
 
 
@@ -1184,8 +1187,7 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
-    swa_state: dict[str, Tensor] | None = None
-    swa_count = 0
+    ema_state: dict[str, Tensor] | None = None
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1258,16 +1260,15 @@ def main() -> None:
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
 
-        # SWA: collect checkpoints during warmdown
-        if args.swa_enabled and scale < args.swa_start_frac and step % args.swa_every == 0:
-            if swa_state is None:
-                swa_state = {name: t.detach().cpu().clone() for name, t in base_model.state_dict().items()}
-                swa_count = 1
-                log0(f"swa:start step:{step}")
+        # EMA: exponential moving average updated every step
+        if args.ema_enabled:
+            decay = args.ema_decay
+            if ema_state is None:
+                ema_state = {name: t.detach().cpu().clone().float() for name, t in base_model.state_dict().items()}
+                log0(f"ema:start step:{step} decay:{decay}")
             else:
                 for name, t in base_model.state_dict().items():
-                    swa_state[name] += t.detach().cpu()
-                swa_count += 1
+                    ema_state[name].mul_(decay).add_(t.detach().cpu().float(), alpha=1.0 - decay)
 
         should_log_train = (
             args.train_log_every > 0
@@ -1295,13 +1296,13 @@ def main() -> None:
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
 
-    # Apply SWA if collected
-    if args.swa_enabled and swa_state is not None and swa_count > 1:
-        log0(f"swa:applying averaged {swa_count} checkpoints")
+    # Apply EMA weights
+    if args.ema_enabled and ema_state is not None:
+        log0("ema:applying shadow weights")
         current_state = base_model.state_dict()
         avg_state = {
-            name: (tensor / swa_count).to(dtype=current_state[name].dtype)
-            for name, tensor in swa_state.items()
+            name: tensor.to(dtype=current_state[name].dtype)
+            for name, tensor in ema_state.items()
         }
         base_model.load_state_dict(avg_state, strict=True)
 
