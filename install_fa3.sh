@@ -20,7 +20,7 @@ cd flash-attention/hopper
 
 # 3) Build FA3
 # Lower MAX_JOBS if RAM is limited
-MAX_JOBS=4 NVCC_THREADS=2 python setup.py install
+MAX_JOBS=64 NVCC_THREADS=4 python setup.py install
 
 # 4) Smoke test
 python - <<'PY'
